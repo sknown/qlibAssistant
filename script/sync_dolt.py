@@ -256,6 +256,27 @@ def _dataframe_omit_name_column(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=drop_cols)
 
 
+def _create_table_sql_from_dataframe(table: str, df: pd.DataFrame) -> str:
+    """从 DataFrame 推断列类型生成 CREATE TABLE IF NOT EXISTS。"""
+    safe = _sql_ident(table)
+    col_defs: list[str] = []
+    for col in df.columns:
+        safe_col = _sql_ident(str(col))
+        dtype = df[col].dtype
+        if pd.api.types.is_integer_dtype(dtype):
+            sql_type = "BIGINT"
+        elif pd.api.types.is_float_dtype(dtype):
+            sql_type = "DOUBLE"
+        elif pd.api.types.is_bool_dtype(dtype):
+            sql_type = "BOOLEAN"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            sql_type = "DATETIME"
+        else:
+            sql_type = "TEXT"
+        col_defs.append(f"{safe_col} {sql_type}")
+    return f"CREATE TABLE IF NOT EXISTS {safe} ({', '.join(col_defs)})"
+
+
 def _insert_batch_sql(table: str, df: pd.DataFrame, start: int, end: int) -> str:
     safe_t = _sql_ident(table)
     cols = [_sql_ident(c) for c in df.columns]
@@ -305,20 +326,39 @@ def push_table_from_csv(
     safe = table.replace("`", "``")
 
     if match_dolt_columns:
-        dolt_cols = fetch_dolt_table_columns(table)
-        overlap = [c for c in dolt_cols if c in df.columns]
-        if len(df) > 0 and not overlap:
-            raise DoltHubSqlError(
-                "本地 CSV 与 Dolt 表列名无交集，无法提交（请检查列名是否与云端一致）",
-            )
-        df = align_dataframe_to_dolt_columns(df, dolt_cols)
+        try:
+            dolt_cols = fetch_dolt_table_columns(table)
+            _need_create_table = False
+        except DoltHubSqlError:
+            # 表可能还不存在，跳过列对齐，后续会通过 write API 创建
+            print(f"ℹ️  DESCRIBE `{table}` 失败（表可能还不存在），将通过 write API 创建表。")
+            dolt_cols = None
+            _need_create_table = True
+
+        if dolt_cols is not None:
+            overlap = [c for c in dolt_cols if c in df.columns]
+            if len(df) > 0 and not overlap:
+                raise DoltHubSqlError(
+                    "本地 CSV 与 Dolt 表列名无交集，无法提交（请检查列名是否与云端一致）",
+                )
+            df = align_dataframe_to_dolt_columns(df, dolt_cols)
+        else:
+            dolt_cols = list(df.columns)
+    else:
+        _need_create_table = False
 
     if omit_name_column:
         df = _dataframe_omit_name_column(df)
 
     print(f"📤 写入分支 `{tb}`（基于 `{fb}`），目标表 `{table}`，共 {len(df)} 行，列 {list(df.columns)} …")
 
-    # 1) 清空表（在临时分支上）
+    # 1a) 若表不存在，先在临时分支上创建
+    if _need_create_table:
+        create_sql = _create_table_sql_from_dataframe(table, df)
+        print(f"📦 正在通过 write API 创建表 `{table}` …")
+        dolt_sql_write(create_sql, fb, tb)
+
+    # 1b) 清空表（在临时分支上）
     dolt_sql_write(f"DELETE FROM `{safe}`", fb, tb)
 
     # 2) 分批 INSERT
