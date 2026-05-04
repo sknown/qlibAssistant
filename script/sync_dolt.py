@@ -38,7 +38,7 @@ import pandas as pd
 import requests
 
 # 默认仓库（可被 Fire 顶层参数覆盖）
-OWNER = "touhoufan"
+OWNER = "lhrn"
 DATABASE = "qlibDailyCsv"
 REF = os.getenv("DOLT_REF", "main").strip() or "main"
 TOKEN = os.getenv("DOLT_TOKEN")
